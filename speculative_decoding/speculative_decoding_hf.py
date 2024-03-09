@@ -101,11 +101,16 @@ def find_first_true_index(bool_tensor, dim = -1):
     return (bool_tensor.cumsum(dim = dim) == 0).sum(dim = dim)
 
 @torch.no_grad()
-def speculative_decoding(
+def speculative_decoding_hf(
     net: Module,
     small_net: Module,
     prompt: Tensor,
     seq_len: int,
+    encoder_small: Tensor,
+    encoder_large: Tensor,
+    tokenizer,
+    small_lm_head: Module,
+    large_lm_head: Module,
     gamma: int = 5,
     temperature = 1.,
     filter_thres = 0.9,
@@ -114,59 +119,106 @@ def speculative_decoding(
 ):
     """
     eq. algorithm 1 in paper https://arxiv.org/abs/2211.17192
-    """
-
-    batch, prompt_seq_len, out, device = *prompt.shape, prompt.clone(), prompt.device
-    sample_num_times = max(0, seq_len - prompt_seq_len)
+    """    
+    # batch, prompt_seq_len, out, device = *prompt.shape, prompt.clone(), prompt.device
+    batch = 1
+    
+    test_device = "cuda:4"
+    
+    # out = torch.cat([out, torch.tensor([[tokenizer.lang_code_to_id["fra_Latn"]]]*batch).to(device)], dim=1)
 
     cache = None
     small_cache = None
 
     num_steps = 0
     total_accepted = 0
+    
+    encoder_small = encoder_small.to(test_device)
+    encoder_large = encoder_large.to(test_device)
 
-    batch_range = torch.arange(batch, device = device, dtype = torch.long)[..., None]
-    seq_lens = torch.full((batch,), prompt_seq_len, device = device, dtype = torch.long)
+    # batch_range = torch.arange(batch, device = device, dtype = torch.long)[..., None]
+    seq_lens = torch.full((batch,), 0, device = test_device, dtype = torch.long)
+    decoder_input_ids = torch.tensor([[tokenizer.eos_token_id, tokenizer.lang_code_to_id["fra_Latn"]]], device=test_device)
+    # all_decoder_input_ids = []
 
     while (seq_lens < seq_len).any():
-
+        small_cache = None
         # predict with smaller network
 
         all_small_logits = []
         q_sampled_out = []
-
+        generate_count = 0
+        # small_net = small_net.to(test_device)
+        # small_lm_head = small_lm_head.to(test_device)
         for _ in range(gamma):
-            small_logits, small_cache = small_net(
-                out,
-                seq_start_pos = out.shape[-1] - seq_lens,
-                cache = small_cache,
-                return_cache = True
+            
+            model_inputs = {
+                "input_ids": decoder_input_ids,
+                "encoder_hidden_states": encoder_small,
+                "past_key_values": small_cache,
+                "use_cache": True,
+                "return_dict": True
+            }
+            
+            outputs = small_net(
+                **model_inputs
             )
-
-            small_logits = small_logits[:, -1]
+            
+            small_logits = small_lm_head(outputs.last_hidden_state)[:, -1]
 
             small_logits = top_k(small_logits, thres = filter_thres)
             all_small_logits.append(small_logits)
+            
+            predicted_token_ids = torch.argmax(small_logits, dim=-1)
+            decoder_input_ids = torch.cat([decoder_input_ids, predicted_token_ids.unsqueeze(0)], dim=-1)
+            # print(decoder_input_ids)
+            # all_decoder_input_ids.append(decoder_input_ids)
 
-            sample = gumbel_sample(small_logits, temperature = temperature, dim = -1)
-            out = torch.cat((out, sample[..., None]), dim = -1)
+            # out = torch.cat((out, predicted_token_ids.unsqueeze(0)), dim=-1)
             seq_lens += 1
 
-            q_sampled_out.append(rearrange(sample, 'b -> b 1 1'))
-
+            q_sampled_out.append(rearrange(predicted_token_ids, 'b -> b 1 1'))
+            small_cache = outputs.past_key_values
+            generate_count += 1
+            
+            if predicted_token_ids.item() == tokenizer.eos_token_id:
+                break
+            
+        # small_net = small_net.to("cpu")
+        # small_lm_head = small_lm_head.to("cpu")
+        
         q_sampled_out = torch.cat(q_sampled_out, dim = -2)
+        # print(q_sampled_out)
         small_logits = torch.stack(all_small_logits, dim = -2)
 
         # verify with larger network
+        # ids_for_large_model = torch.cat([prompt]*(gamma + 1), dim=0)
+        # padding_id = small_net.config.pad_token_id
+        # max_len_decoded = max([x.shape[-1] for x in all_decoder_input_ids])
+        # num_tokens_to_pad = [max_len_decoded - x.shape[-1] for x in all_decoder_input_ids]
+        # padding_lst = [torch.tensor([padding_id]*x, device="cuda:4").unsqueeze(0) for x in num_tokens_to_pad]
 
-        logits, cache = net(
-            out,
-            seq_start_pos = out.shape[-1] - seq_lens,
-            cache = cache,
-            return_cache = True
+        # large_decoding_input_ids = torch.cat([torch.cat([x, y], dim=1) for x, y in zip(all_decoder_input_ids, padding_lst)], dim=0).int()
+        # decoder_attention_mask = (large_decoding_input_ids != padding_id)
+        # decoder_token_large_id = torch.tensor([out[:, -1]], device="cuda:0")
+        
+        larger_model_inputs = {
+            'input_ids': decoder_input_ids,
+            'encoder_hidden_states': encoder_large,
+            "use_cache": True,
+            "return_dict": True
+        }
+       
+        # net = net.to(test_device)
+        # large_lm_head = large_lm_head.to(test_device) 
+        large_outputs = net(
+            **larger_model_inputs
         )
+        
+        logits = large_lm_head(large_outputs.last_hidden_state)[:, -(generate_count + 1):, :]
+        # net = net.to("cpu")
+        # large_lm_head = large_lm_head.to("cpu")
 
-        logits = logits[..., -(gamma + 1):, :]
         logits = top_k(logits, thres = filter_thres)
 
         # prob and prob of small model (p(x) and q(x) in algorithm 1)
@@ -188,13 +240,15 @@ def speculative_decoding(
         total_accepted += accepted.float().mean()
         num_steps += 1
 
-        num_rejected = gamma - accepted
+        num_rejected = generate_count - accepted
         has_rejected = num_rejected > 0
 
         accepted = rearrange(accepted, 'b -> b 1')
-        accepted.clamp_(max = gamma - 1)
-        adjusted_prob = F.relu(prob[batch_range, accepted] - small_prob[batch_range, accepted])
+        accepted.clamp_(max = generate_count - 1)
+
+        adjusted_prob = F.relu(prob[0, accepted] - small_prob[0, accepted])
         adjusted_prob = adjusted_prob / adjusted_prob.sum(dim = -1, keepdim = True)
+
         adjusted_prob = rearrange(adjusted_prob, 'b 1 d -> b d')
 
         prob_next = torch.where(
@@ -205,52 +259,74 @@ def speculative_decoding(
 
         # do a bunch of slicing and align everything to the right, including kv caches
 
-        max_num_rejected = num_rejected.amax()
-        seq_arange = torch.arange(out.shape[-1], device = device, dtype = torch.long)
-        seq_offset_indices = seq_arange + (max_num_rejected - num_rejected)[..., None]
+        # max_num_rejected = num_rejected.amax()
+        # seq_arange = torch.arange(out.shape[-1], device = device, dtype = torch.long)
+        # seq_offset_indices = seq_arange + (max_num_rejected - num_rejected)[..., None]
 
         seq_lens -= num_rejected
-        max_seq_len = seq_lens.amax()
+        # print(seq_lens)
+        # max_seq_len = seq_lens.amax()
+        
+        # out = F.pad(out, (0, max_num_rejected), value = pad_id)
+        # out = out[batch_range, seq_offset_indices]
 
-        if batch > 1:
-            out = F.pad(out, (0, max_num_rejected), value = pad_id)
-            out = out[batch_range, seq_offset_indices]
+        # if batch > 1:
+        #     out = F.pad(out, (0, max_num_rejected), value = pad_id)
+        #     out = out[batch_range, seq_offset_indices]
 
-            cache = tuple(F.pad(t, (0, 0, 0, max_num_rejected), value = pad_id) for t in cache)
-            small_cache = tuple(F.pad(t, (0, 0, 0, max_num_rejected), value = pad_id) for t in small_cache)
+        #     cache = tuple(F.pad(t, (0, 0, 0, max_num_rejected), value = pad_id) for t in cache)
+        #     small_cache = tuple(F.pad(t, (0, 0, 0, max_num_rejected), value = pad_id) for t in small_cache)
 
-            cache = tuple(rearrange(t, 'b ... n d -> b n ... d') for t in cache)
-            small_cache = tuple(rearrange(t, 'b ... n d -> b n ... d') for t in small_cache)
+        #     cache = tuple(rearrange(t, 'b ... n d -> b n ... d') for t in cache)
+        #     small_cache = tuple(rearrange(t, 'b ... n d -> b n ... d') for t in small_cache)
 
-            cache = tuple(t[batch_range, seq_offset_indices] for t in cache)
-            small_cache = tuple(t[batch_range, seq_offset_indices] for t in small_cache)
+        #     cache = tuple(t[batch_range, seq_offset_indices] for t in cache)
+        #     small_cache = tuple(t[batch_range, seq_offset_indices] for t in small_cache)
 
-            cache = tuple(rearrange(t, 'b n ... d -> b ... n d') for t in cache)
-            small_cache = tuple(rearrange(t, 'b n ... d -> b ... n d') for t in small_cache)
+        #     cache = tuple(rearrange(t, 'b n ... d -> b ... n d') for t in cache)
+        #     small_cache = tuple(rearrange(t, 'b n ... d -> b ... n d') for t in small_cache)
 
-            if out.shape[-1] > max_seq_len:
-                left_index = out.shape[-1] - max_seq_len
-                out = out[:, left_index:]
-                cache = tuple(t[..., left_index:, :] for t in cache)
-                small_cache = tuple(t[..., left_index:, :] for t in small_cache)
+        # if out.shape[-1] > max_seq_len:
+        #     left_index = out.shape[-1] - max_seq_len
+        #     out = out[:, left_index:]
+            # cache = tuple(t[..., left_index:, :] for t in cache)
+            # small_cache = tuple(t[..., left_index:, :] for t in small_cache)
 
         # sample the additional token, one of the tricks in the paper to better bound the worst case
+        # next_token = torch.multinomial(prob_next, 1)
+        # print(next_token)
+        next_token = torch.argmax(prob_next, dim=-1).unsqueeze(0)
 
-        next_token = torch.multinomial(prob_next, 1)
+        if num_rejected.item() > 0:
+            decoder_input_ids = decoder_input_ids[:, :-num_rejected.item()]
+        
+        # print(decoder_input_ids)
+        
+        if decoder_input_ids[:, -1].item() == tokenizer.eos_token_id:
+            break
 
-        out = torch.cat((out, next_token), dim = -1)
+        decoder_input_ids = torch.cat((decoder_input_ids, next_token), dim = -1)
         seq_lens += 1
+
+        # print(decoder_input_ids)
+        # print(seq_lens)
+        if next_token.item() == tokenizer.eos_token_id:
+            break
 
     # now left align
 
-    num_pad_left = out.shape[-1] - seq_lens
-    max_pad_left = num_pad_left.amax()
-    out = F.pad(out, (0, max_pad_left), value = pad_id)
+    # num_pad_left = out.shape[-1] - seq_lens
+    # max_pad_left = num_pad_left.amax()
+    # out = F.pad(out, (0, max_pad_left), value = pad_id)
 
-    seq_len_range = torch.arange(seq_len, device = device, dtype = torch.long)
-    out = out[batch_range, seq_len_range + num_pad_left[..., None]]
+    # seq_len_range = torch.arange(seq_len, device = device, dtype = torch.long)
+    # out = out[batch_range, seq_len_range + num_pad_left[..., None]]
+    
+    # print(out[..., :prompt_seq_len])
+    # print(out[..., prompt_seq_len:])
+    out = decoder_input_ids
 
-    return out[..., prompt_seq_len:], total_accepted / num_steps
+    return out, total_accepted / num_steps
 
 @torch.no_grad()
 def speculative_decoding_with_same_model(
